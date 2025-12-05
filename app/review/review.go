@@ -14,6 +14,10 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"github.com/bmatcuk/doublestar/v4"
+	config2 "github.com/jc-lab/shim-review-bot/app/config"
+	"github.com/jc-lab/shim-review-bot/app/download"
+	"github.com/jc-lab/shim-review-bot/app/review/testcase"
 	"gopkg.in/yaml.v3"
 	"io"
 	"log"
@@ -36,53 +40,86 @@ type HashSum struct {
 	Path string
 }
 
-type ExportedFile struct {
-	Path string
-	Hash string
+type FileAndHash struct {
+	Path        string
+	Name        string
+	RelatedPath string
+	Hash        string
+}
+
+type PatchFile struct {
+	Path        string
+	Name        string
+	RelatedPath string
+}
+
+type SbatItem struct {
+	Vendor  string
+	Version int
 }
 
 type EfiFile struct {
-	Name               string
-	Hash               string
+	FileAndHash
 	ComputedHash       string
 	Sbat               string
+	SbatLevel          []*SbatItem
 	VendorCert         []byte
 	VendorDeAuthorized []byte
+	FlagNXCompat       bool
+	TestResults        []*testcase.TestResult
 }
 
 type WorkingContext struct {
-	vendorCert []byte
-	sbat       string
+	sourceUrl string
+	source    *download.Source
+
+	vendorCertPath    string
+	vendorCertContent []byte
+	sbatPath          string
+	sbatContent       string
+
+	prebuiltEfiFileHashes map[string]*FileAndHash
+	patchFiles            []*PatchFile
 
 	outputState   outputState
 	hashes        []*HashSum
-	exportedFiles []*ExportedFile
+	exportedFiles map[string]*FileAndHash
 
 	efiFiles []*EfiFile
+
+	sbatLevel string
 
 	buildErr error
 	otherErr error
 }
 
+var (
+	shimEfiPathPattern = regexp.MustCompile("/shim[^.]+\\.efi$")
+)
+
 func Main(flagSet *flag.FlagSet, args []string) {
 	var configFile string
+	var sourceRoot string
 	var buildCommand string
 	var outputFile string
 	var reportFile string
-	var vendorCert string
-	var sbat string
+	var buildLogFile string
+
+	var workingContext WorkingContext
 
 	flagSet.StringVar(&configFile, "config", "", "config file")
+	flagSet.StringVar(&sourceRoot, "source-root", "", "sourceUrl root to find shim.efi")
+	flagSet.StringVar(&workingContext.sourceUrl, "source", "", "source url")
 
 	flagSet.StringVar(&buildCommand, "build-script", "", "build-script file")
 	flagSet.StringVar(&outputFile, "output-file", "", "docker output file (tar)")
-	flagSet.StringVar(&vendorCert, "vendor-cert", "vendor_cert.der", "vendor cert der file")
-	flagSet.StringVar(&sbat, "sbat", "sbat.csv", "vendor cert der file")
+	flagSet.StringVar(&workingContext.vendorCertPath, "vendor-cert", "vendor_cert.der", "vendor cert der file")
+	flagSet.StringVar(&workingContext.sbatPath, "sbat", "sbat.csv", "vendor cert der file")
+	flagSet.StringVar(&buildLogFile, "build-log", "", "build log output file")
 
 	flagSet.StringVar(&reportFile, "report-output", "", "report output file")
 	flagSet.Parse(args)
 
-	var workingContext WorkingContext
 	var sbatRaw []byte
 	var tempDir string
 
@@ -95,7 +132,7 @@ func Main(flagSet *flag.FlagSet, args []string) {
 			goto done
 		}
 
-		var config Config
+		var config config2.Config
 		if err = yaml.Unmarshal(raw, &config); err != nil {
 			err = fmt.Errorf("config file parse failed: %v", err)
 			log.Println(err)
@@ -103,6 +140,9 @@ func Main(flagSet *flag.FlagSet, args []string) {
 			goto done
 		}
 
+		if config.Source != "" {
+			workingContext.sourceUrl = config.Source
+		}
 		if config.BuildScript != "" {
 			buildCommand = config.BuildScript
 		}
@@ -110,27 +150,48 @@ func Main(flagSet *flag.FlagSet, args []string) {
 			outputFile = config.OutputFile
 		}
 		if config.VendorCert != "" {
-			vendorCert = config.VendorCert
+			workingContext.vendorCertPath = config.VendorCert
 		}
 		if config.Sbat != "" {
-			sbat = config.Sbat
+			workingContext.sbatPath = config.Sbat
 		}
 	}
 
-	workingContext.vendorCert, workingContext.otherErr = os.ReadFile(vendorCert)
+	if workingContext.sourceUrl != "" {
+		workingContext.source = download.ParseSourceUrl(workingContext.sourceUrl)
+	}
+
+	workingContext.vendorCertContent, workingContext.otherErr = os.ReadFile(workingContext.vendorCertPath)
 	if workingContext.otherErr != nil {
 		log.Printf("vendor_cert open failed: %v", workingContext.otherErr)
 		goto done
 	}
 
-	sbatRaw, workingContext.otherErr = os.ReadFile(sbat)
+	sbatRaw, workingContext.otherErr = os.ReadFile(workingContext.sbatPath)
 	if workingContext.otherErr != nil {
-		log.Printf("sbat.csv open failed: %v", workingContext.otherErr)
+		log.Printf("sbatContent.csv open failed: %v", workingContext.otherErr)
 		goto done
 	}
-	workingContext.sbat = string(sbatRaw)
+	workingContext.sbatContent = string(sbatRaw)
 
-	workingContext.buildErr = workingContext.build(buildCommand)
+	workingContext.otherErr = workingContext.findPrebuiltEfiFiles(sourceRoot)
+	if workingContext.otherErr != nil {
+		log.Printf("cannot find prebuilt efi files: %v", workingContext.otherErr)
+		goto done
+	} else if len(workingContext.prebuiltEfiFileHashes) == 0 {
+		err := fmt.Errorf("cannot find prebuilt efi files in %s", sourceRoot)
+		workingContext.otherErr = err
+		log.Println(err)
+		goto done
+	}
+
+	workingContext.otherErr = workingContext.findPatches(sourceRoot)
+	if workingContext.otherErr != nil {
+		log.Printf("cannot find patch files: %v", workingContext.otherErr)
+		goto done
+	}
+
+	workingContext.buildErr = workingContext.build(buildCommand, buildLogFile)
 	if workingContext.buildErr != nil {
 		log.Printf("build failed: %v", workingContext.buildErr)
 		goto done
@@ -161,8 +222,11 @@ func Main(flagSet *flag.FlagSet, args []string) {
 		}
 
 		efiFile := &EfiFile{
-			Name:         basename,
-			Hash:         item.Hash,
+			FileAndHash: FileAndHash{
+				Path:        basename,
+				Hash:        item.Hash,
+				RelatedPath: item.RelatedPath,
+			},
 			ComputedHash: computedHash,
 		}
 
@@ -173,25 +237,42 @@ func Main(flagSet *flag.FlagSet, args []string) {
 		}
 		defer peFile.Close()
 
-		sbat := peFile.Section(".sbat")
-		if sbat != nil {
-			raw, err := sbat.Data()
+		section := peFile.Section(".sbat")
+		if section != nil {
+			raw, err := section.Data()
 			if err != nil {
-				log.Printf("sbat read failed: %v", err)
+				log.Printf(".sbat read failed: %v", err)
 			} else {
-				nullPos := bytes.IndexByte(raw, 0)
-				if nullPos > 0 {
-					raw = raw[:nullPos]
-				}
+				raw = raw[:section.VirtualSize]
 				efiFile.Sbat = string(raw)
 			}
 		}
-		certTableSection := peFile.Section(".vendor_cert")
-		if certTableSection != nil {
-			raw, err := certTableSection.Data()
+
+		section = peFile.Section(".sbatlevel")
+		if section != nil {
+			raw, err := section.Data()
+			if err != nil {
+				log.Printf(".sbatlevel read failed: %v", err)
+			} else {
+				raw = raw[:section.VirtualSize]
+				for _, chunk := range bytes.Split(raw[12:], []byte{0}) {
+					if len(chunk) == 0 {
+						break
+					}
+					workingContext.sbatLevel = string(chunk)
+					efiFile.SbatLevel = parseSbat(string(chunk))
+				}
+			}
+		}
+
+		section = peFile.Section(".vendor_cert")
+		if section != nil {
+			raw, err := section.Data()
 			if err != nil {
 				log.Printf("vendor_cert read failed: %v", err)
 			} else {
+				raw = raw[:section.VirtualSize]
+
 				vendorAuthorizedSize := binary.LittleEndian.Uint32(raw[0:4])
 				vendorDeAuthorizedSize := binary.LittleEndian.Uint32(raw[4:8])
 				vendorAuthorizedOffset := binary.LittleEndian.Uint32(raw[8:12])
@@ -205,6 +286,18 @@ func Main(flagSet *flag.FlagSet, args []string) {
 				}
 			}
 		}
+
+		if optional, ok := peFile.OptionalHeader.(*pe.OptionalHeader64); ok {
+			efiFile.FlagNXCompat = optional.DllCharacteristics&0x100 != 0
+		}
+		if optional, ok := peFile.OptionalHeader.(*pe.OptionalHeader32); ok {
+			efiFile.FlagNXCompat = optional.DllCharacteristics&0x100 != 0
+		}
+
+		testContext := &testcase.TestContext{
+			Pe: peFile,
+		}
+		efiFile.TestResults = testcase.DoTests(testContext)
 
 		workingContext.efiFiles = append(workingContext.efiFiles, efiFile)
 	}
@@ -227,7 +320,62 @@ var (
 	hashSumPattern = regexp.MustCompile("([0-9a-f]+)\\s+(.+)")
 )
 
-func (w *WorkingContext) build(buildCommand string) error {
+func (w *WorkingContext) findPrebuiltEfiFiles(sourceRoot string) error {
+	pattern := sourceRoot + "/**/shim*.efi"
+	efiFiles, err := doublestar.FilepathGlob(pattern)
+	if err != nil {
+		return err
+	}
+	log.Printf("Search prebuilt shim efi files with '%s': %v", pattern, efiFiles)
+
+	w.prebuiltEfiFileHashes = map[string]*FileAndHash{}
+
+	for _, file := range efiFiles {
+		hash, err := hashFileSha256(file)
+		if err != nil {
+			log.Printf("file(%s) hash failed: %v", file, err)
+		} else {
+			name := filepath.Base(file)
+			rel, err := filepath.Rel(sourceRoot, file)
+			if err != nil {
+				log.Println("filepath.Rel failed: ", err)
+			}
+			w.prebuiltEfiFileHashes[name] = &FileAndHash{
+				Path:        name,
+				RelatedPath: rel,
+				Hash:        hash,
+			}
+		}
+	}
+
+	return nil
+}
+
+func (w *WorkingContext) findPatches(sourceRoot string) error {
+	pattern := sourceRoot + "/**/*.patch"
+	patchFiles, err := doublestar.FilepathGlob(pattern)
+	if err != nil {
+		return err
+	}
+	log.Printf("Search patch files with '%s': %v", pattern, patchFiles)
+
+	for _, file := range patchFiles {
+		name := filepath.Base(file)
+		rel, err := filepath.Rel(sourceRoot, file)
+		if err != nil {
+			log.Println("filepath.Rel failed: ", err)
+		}
+		w.patchFiles = append(w.patchFiles, &PatchFile{
+			Name:        name,
+			Path:        file,
+			RelatedPath: rel,
+		})
+	}
+
+	return nil
+}
+
+func (w *WorkingContext) build(buildCommand string, logFile string) error {
 	cmd := exec.Command(buildCommand)
 	cmd.Stdin = os.Stdin
 
@@ -241,12 +389,30 @@ func (w *WorkingContext) build(buildCommand string) error {
 		return err
 	}
 
+	var logFileStream io.WriteCloser
+	if logFile != "" {
+		logFileStream, err = os.OpenFile(logFile, os.O_RDWR|os.O_CREATE, 0644)
+	}
+	defer func() {
+		if logFileStream != nil {
+			logFileStream.Close()
+		}
+	}()
+
 	go func() {
-		reader := io.TeeReader(stderr, os.Stderr)
+		dest := logFileStream
+		if dest == nil {
+			dest = os.Stderr
+		}
+		reader := io.TeeReader(stderr, dest)
 		w.handleOutput(reader)
 	}()
 	go func() {
-		reader := io.TeeReader(stdout, os.Stdout)
+		dest := logFileStream
+		if dest == nil {
+			dest = os.Stdout
+		}
+		reader := io.TeeReader(stdout, dest)
 		w.handleOutput(reader)
 	}()
 
@@ -291,6 +457,8 @@ func (w *WorkingContext) handleOutput(r io.Reader) {
 }
 
 func (w *WorkingContext) extractFiles(tarFile string, outputDirectory string) error {
+	w.exportedFiles = map[string]*FileAndHash{}
+
 	file, err := os.Open(tarFile)
 	if err != nil {
 		return err
@@ -309,36 +477,78 @@ func (w *WorkingContext) extractFiles(tarFile string, outputDirectory string) er
 			break
 		}
 
-		var hashEntry *HashSum
-		for _, s := range w.hashes {
-			if s.Path[1:] == header.Name {
-				hashEntry = s
+		baseName := filepath.Base(header.Name)
+		destFileName := filepath.Join(outputDirectory, baseName)
+
+		if len(w.hashes) > 0 {
+			// If there is a hash in the build log
+
+			var hashEntry *HashSum
+			for _, s := range w.hashes {
+				if s.Path[1:] == header.Name {
+					hashEntry = s
+				}
+			}
+
+			if hashEntry != nil {
+				f, err := os.OpenFile(destFileName, os.O_CREATE|os.O_RDWR, 0644)
+				if err != nil {
+					return err
+				}
+				defer f.Close()
+				if _, err = io.Copy(f, reader); err != nil {
+					return err
+				}
+
+				w.exportedFiles[baseName] = &FileAndHash{
+					Path:        destFileName,
+					Name:        baseName,
+					RelatedPath: hashEntry.Path,
+					Hash:        hashEntry.Hash,
+				}
+				continue
+			}
+		} else {
+			// Find shim*.efi files by pattern.
+			if shimEfiPathPattern.MatchString(header.Name) {
+				log.Printf("found shim*.efi in '%s'", header.Name)
+				f, err := os.OpenFile(destFileName, os.O_CREATE|os.O_RDWR, 0644)
+				if err != nil {
+					return err
+				}
+				defer f.Close()
+				if _, err = io.Copy(f, reader); err != nil {
+					return err
+				}
+
+				w.exportedFiles[baseName] = &FileAndHash{
+					Path:        destFileName,
+					Name:        filepath.Base(header.Name),
+					RelatedPath: header.Name,
+					Hash:        "",
+				}
+				continue
 			}
 		}
 
-		if hashEntry != nil {
-			destFileName := filepath.Join(outputDirectory, filepath.Base(header.Name))
-			f, err := os.OpenFile(destFileName, os.O_CREATE|os.O_RDWR, 0644)
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-			if _, err = io.Copy(f, reader); err != nil {
-				return err
-			}
-
-			w.exportedFiles = append(w.exportedFiles, &ExportedFile{
-				Path: destFileName,
-				Hash: hashEntry.Hash,
-			})
-		} else {
-			if _, err = io.Copy(&DummyWriter{}, reader); err != nil {
-				return err
-			}
+		if _, err = io.Copy(&DummyWriter{}, reader); err != nil {
+			return err
 		}
 	}
 
 	return nil
+}
+
+func (w *WorkingContext) buildPathToUrl(filepath string) string {
+	return w.sourceUrl + "/" + filepath
+}
+
+func (w *WorkingContext) absPathToUrl(filepath string) string {
+	if w.source == nil {
+		return filepath
+	}
+	prefix := strings.TrimSuffix(strings.TrimSuffix(w.sourceUrl, "/"+w.source.Directory), "/")
+	return prefix + "/" + filepath
 }
 
 func (w *WorkingContext) buildReport() string {
@@ -365,14 +575,15 @@ func (w *WorkingContext) buildReport() string {
 	if true {
 		// ==================== VENDOR CERTIFICATE ====================
 		report += "## Vendor Certificate\n\n"
-		cert, err := x509.ParseCertificate(w.vendorCert)
+		report += "Source: " + w.buildPathToUrl(w.vendorCertPath) + "\n"
+		cert, err := x509.ParseCertificate(w.vendorCertContent)
 		if err != nil {
 			success = false
 			report += "ERROR: " + err.Error() + "\n"
 		} else {
 			encoded := pem.EncodeToMemory(&pem.Block{
 				Type:  "CERTIFICATE",
-				Bytes: w.vendorCert,
+				Bytes: w.vendorCertContent,
 			})
 			report += "```\n" + string(encoded) + "\n```\n"
 			report += "- Issuer : " + cert.Issuer.String() + "\n"
@@ -394,19 +605,24 @@ func (w *WorkingContext) buildReport() string {
 				report += "- [X] ExtKeyUsage/CodeSigning : OK\n"
 			} else {
 				success = false
-				report += "- [ ] ExtKeyUsage/CodeSigning : **NO DigitalSignature in Key Usage!!!**\n"
+				report += "- [ ] ExtKeyUsage/CodeSigning : **NO CodeSigning in Ext Key Usage!!!**\n"
 			}
 		}
 		report += "\n"
 
+		// ==================== SBAT LEVEL ====================
+		report += "## SBAT LEVEL (in prebuilt efi file)\n\n"
+		report += "```\n" + w.sbatLevel + "\n```\n\n"
+
 		// ==================== SBAT ====================
 		report += "## SBAT\n\n"
-		report += "```\n" + w.sbat + "\n```\n\n"
-		sbatReader := csv.NewReader(strings.NewReader(w.sbat))
+		report += "Source: " + w.buildPathToUrl(w.sbatPath) + "\n"
+		report += "```\n" + w.sbatContent + "\n```\n\n"
+		sbatReader := csv.NewReader(strings.NewReader(w.sbatContent))
 		records, err := sbatReader.ReadAll()
 		_ = records
 		if err == nil {
-			report += "- [X] CSV Format Check : OK (Caution: Check only csv format, not sbat format)\n"
+			report += "- [X] CSV Format Check : OK (Caution: Check only csv format, not .sbat format)\n"
 		} else {
 			success = false
 			report += "- [ ] CSV Format Check : **FAILED**: " + err.Error() + "\n"
@@ -414,16 +630,46 @@ func (w *WorkingContext) buildReport() string {
 		report += "\n"
 
 		// ==================== EFI FILES ====================
+		prebuiltFiles := map[string]*FileAndHash{}
+		for k, v := range w.prebuiltEfiFileHashes {
+			prebuiltFiles[k] = v
+		}
+
 		for _, file := range w.efiFiles {
-			report += fmt.Sprintf("## EFI FILE: %s\n\n", filepath.Base(file.Name))
-			if file.Hash == file.ComputedHash {
-				report += fmt.Sprintf("- hash (sha256) : %s\n", file.Hash)
+			filename := filepath.Base(file.Path)
+			prebuilt, found := prebuiltFiles[filename]
+
+			report += fmt.Sprintf("## EFI FILE: %s\n\n", filepath.Base(file.Path))
+
+			report += "- reproduced file: " + file.RelatedPath + "\n"
+			report += fmt.Sprintf("- computed hash (sha256) : %s\n", file.ComputedHash)
+
+			if found {
+				report += "- prebuilt file: " + w.absPathToUrl(prebuilt.RelatedPath) + "\n"
+
+				delete(prebuiltFiles, filename)
+				if prebuilt.Hash == file.ComputedHash {
+					report += "- [X] Reproduce: Same hash\n"
+				} else {
+					success = false
+					report += "- [ ] Reproduce: Different hash!!!\n"
+					report += "- prebuilt hash: " + prebuilt.Hash + "\n"
+					report += "- reproduced hash: " + file.ComputedHash + "\n"
+				}
 			} else {
 				success = false
-				report += fmt.Sprintf("- hash : %s (INCORRECT)\n", file.Hash)
-				report += fmt.Sprintf("- computed hash (sha256) : %s\n", file.ComputedHash)
+				report += "- Not Found in prebuilt file!!!\n"
 			}
-			if file.Sbat == w.sbat {
+
+			if file.Hash != "" {
+				if file.Hash == file.ComputedHash {
+					report += fmt.Sprintf("- hash (sha256) : %s\n", file.Hash)
+				} else {
+					success = false
+					report += fmt.Sprintf("- hash : %s (INCORRECT)\n", file.Hash)
+				}
+			}
+			if file.Sbat == w.sbatContent {
 				report += "- [X] sbat : SAME\n"
 			} else {
 				success = false
@@ -436,10 +682,10 @@ func (w *WorkingContext) buildReport() string {
 				report += "- **VENDOR CERT IS EMPTY!!!**\n"
 			} else {
 				efiVendorCert := file.VendorCert
-				if len(efiVendorCert) > len(w.vendorCert) {
-					efiVendorCert = efiVendorCert[:len(w.vendorCert)]
+				if len(efiVendorCert) > len(w.vendorCertContent) {
+					efiVendorCert = efiVendorCert[:len(w.vendorCertContent)]
 				}
-				if bytes.Equal(w.vendorCert, efiVendorCert) {
+				if bytes.Equal(w.vendorCertContent, efiVendorCert) {
 					report += "- [X] vendor_cert : SAME\n"
 				} else {
 					success = false
@@ -452,7 +698,43 @@ func (w *WorkingContext) buildReport() string {
 					report += "```\n" + string(encoded) + "\n```\n"
 				}
 			}
+
+			if file.FlagNXCompat {
+				report += "- [X] NX Compat: True\n"
+			} else {
+				success = false
+				report += "- [ ] NX Compat: False\n"
+			}
+
+			for _, testResult := range file.TestResults {
+				if testResult.Result {
+					report += "- [X] " + testResult.Name + "\n"
+				} else {
+					report += "- [ ] " + testResult.Name + "\n"
+					report += testResult.Message + "\n"
+				}
+			}
+
 			report += "\n"
+		}
+
+		for _, item := range prebuiltFiles {
+			success = false
+			report += "## Not Built EFI File: " + item.Name + "\n"
+			report += "- [ ] It is prebuilt, but not built as a Dockerfile.\n"
+			report += "- hash : " + item.Hash + "\n"
+			report += "\n"
+		}
+	}
+
+	report += "## Patch Files\n"
+
+	if len(w.patchFiles) == 0 {
+		report += "- No Patch Files\n"
+	} else {
+		report += ":robot: Human, “Why patches are being applied?” Please check.\n"
+		for _, patch := range w.patchFiles {
+			report += fmt.Sprintf("- [%s](%s)\n", patch.Name, w.absPathToUrl(patch.RelatedPath))
 		}
 	}
 
